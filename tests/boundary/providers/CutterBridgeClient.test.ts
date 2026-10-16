@@ -1,4 +1,5 @@
 import { createServer } from "node:net";
+import { execFile } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
@@ -12,11 +13,13 @@ import {
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CutterBridgeClient } from "../../../src/cutter/CutterBridgeClient.js";
 import { CutterBridgeService } from "../../../src/cutter/CutterBridgeService.js";
+import { readWithoutFifoWriter } from "../../fixtures/fifoInput.js";
 
 const listen = async (
   server: ReturnType<typeof createServer>,
@@ -748,6 +751,100 @@ describe("CutterBridgeClient: scenario group 3", () => {
         },
       ],
     });
+  });
+});
+
+describe("CutterBridgeClient: descriptor admission", () => {
+  let directory: string | undefined;
+  let server: ReturnType<typeof createServer> | undefined;
+
+  afterEach(async () => {
+    if (server !== undefined)
+      await new Promise<void>((resolve) => server?.close(() => resolve()));
+    if (directory !== undefined)
+      await rm(directory, { recursive: true, force: true });
+    server = undefined;
+    directory = undefined;
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "skips a writer-free FIFO descriptor without blocking discovery",
+    async () => {
+      directory = await mkdtemp(join(tmpdir(), "rea-cutter-fifo-"));
+      const sessionId = "27d3e3f1-f1e5-49ae-91ec-95af1f343a5a";
+      const token = "synthetic-cutter-bridge-token-for-test";
+      const fifoPath = join(
+        directory,
+        `cutter-${process.pid}-3b1f6c2a-7d4e-4a2b-9f31-2c5d8e6a1b40.json`,
+      );
+      await promisify(execFile)("mkfifo", [fifoPath]);
+      server = authenticatedServer(token, sessionId, (_request, respond) =>
+        respond({ ok: true, session_id: sessionId }),
+      );
+      const port = await listen(server);
+      await writeDescriptor(directory, sessionId, port, token);
+
+      const outcome = await readWithoutFifoWriter(fifoPath, () =>
+        createClient({ REA_CUTTER_BRIDGE_DIR: directory }).listSessions(),
+      );
+      expect(outcome.state).toBe("completed");
+      if (outcome.state !== "completed")
+        throw new Error("Cutter discovery waited for a FIFO writer");
+      expect(outcome.result).toMatchObject({
+        discovery_status: "sessions_found",
+        bridge_directory_security: "private_verified",
+        sessions: [{ session_id: sessionId }],
+      });
+    },
+  );
+
+  it("settles discovery cancellation before any socket probe", async () => {
+    directory = await mkdtemp(join(tmpdir(), "rea-cutter-discovery-cancel-"));
+    const sessionId = "27d3e3f1-f1e5-49ae-91ec-95af1f343a5a";
+    await writeDescriptor(
+      directory,
+      sessionId,
+      1234,
+      "synthetic-cutter-bridge-token-for-test",
+    );
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      createClient({ REA_CUTTER_BRIDGE_DIR: directory }).listSessions({
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow();
+  });
+
+  it("rejects discovery aborted after it starts instead of reporting no sessions", async () => {
+    directory = await mkdtemp(join(tmpdir(), "rea-cutter-discovery-midabort-"));
+    for (let index = 0; index < 4; index += 1)
+      await writeDescriptor(
+        directory,
+        `27d3e3f1-f1e5-49ae-91ec-95af1f343a5${String(index)}`,
+        1234,
+        "synthetic-cutter-bridge-token-for-test",
+      );
+    // Deterministically abort partway through the candidate loop: the first
+    // few admission checks pass, then the signal flips to aborted.
+    let checks = 0;
+    const signal = {
+      aborted: false,
+      throwIfAborted(this: { aborted: boolean }): void {
+        checks += 1;
+        if (checks > 2) {
+          this.aborted = true;
+          throw new Error("aborted during discovery");
+        }
+      },
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    } as unknown as AbortSignal;
+    await expect(
+      createClient({ REA_CUTTER_BRIDGE_DIR: directory }).listSessions({
+        signal,
+      }),
+    ).rejects.toThrow();
   });
 });
 
